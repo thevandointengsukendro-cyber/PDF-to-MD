@@ -85,14 +85,15 @@ test('mergeMarkdownDocuments combines multiple completed files with TOC and skip
 });
 
 test('createZipArchive generates a valid PKZIP buffer containing all converted markdown files', () => {
-  const zipBuf = createZipArchive([
+  const zipBytes = createZipArchive([
     { name: 'dokumen-1.md', content: '# Dokumen 1\n\n$$x^2 + y^2 = r^2$$' },
     { name: 'dokumen-2.md', content: '# Dokumen 2\n\nGambar terverifikasi.' },
   ]);
 
   // Verify PK\x03\x04 local file header magic bytes
-  assert.equal(zipBuf.readUInt32LE(0), 0x04034b50);
-  const zipStr = zipBuf.toString('utf8');
+  const view = new DataView(zipBytes.buffer, zipBytes.byteOffset, zipBytes.byteLength);
+  assert.equal(view.getUint32(0, true), 0x04034b50);
+  const zipStr = new TextDecoder().decode(zipBytes);
   assert.ok(zipStr.includes('dokumen-1.md'));
   assert.ok(zipStr.includes('dokumen-2.md'));
   assert.ok(zipStr.includes('$$x^2 + y^2 = r^2$$'));
