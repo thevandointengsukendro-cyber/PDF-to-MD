@@ -11,7 +11,6 @@ import {
   Layers,
   Trash2,
   Download,
-  FileStack,
   CheckSquare,
   Search,
   Zap,
@@ -26,6 +25,7 @@ import {
   mergeMarkdownDocuments,
   createZipArchive,
 } from './utils/pipeline.ts';
+import { extractVerbatimPdfClient } from './utils/pdfExtractor.ts';
 import { QueueItemRow } from './components/QueueItemRow.tsx';
 import { MarkdownViewer } from './components/MarkdownViewer.tsx';
 
@@ -38,16 +38,10 @@ function createInitialSeededJobs(): PdfConversionJob[] {
     pageCount: p.pageCount,
     stage: 'completed',
     progress: 100,
-    stageDetail: 'Konversi selesai — Teks, Gambar & Equation LaTeX utuh',
+    stageDetail: 'Selesai — Transkripsi 1:1 Verbatim Utuh',
     includeInMerge: true,
     visualFindings: p.visualElements,
-    markdownContent: reconcileVisualAndTextToMarkdown({
-      title: p.title,
-      originalName: p.originalName,
-      pageCount: p.pageCount,
-      rawTextLayer: p.rawTextLayer,
-      visualFindings: p.visualElements,
-    }),
+    markdownContent: p.rawTextLayer.trim(),
     createdAt: Date.now() - (3 - i) * 1000,
     completedAt: Date.now() - (3 - i) * 500,
   }));
@@ -69,7 +63,7 @@ export default function App() {
   const [zipFilename, setZipFilename] = useState<string>('bundel-konversi-markdown');
   const [mergedFilename, setMergedFilename] = useState<string>('dokumen-gabungan-lengkap');
   const [mergedDocTitle, setMergedDocTitle] = useState<string>(
-    'Kompilasi Dokumen Riset & Teknis (Hasil Merge Otomatis)'
+    'Kompilasi Dokumen 1:1 Verbatim (Hasil Merge Otomatis)'
   );
   const [includeMergedInZip, setIncludeMergedInZip] = useState<boolean>(true);
   const [filePrefix, setFilePrefix] = useState<string>('');
@@ -102,12 +96,14 @@ export default function App() {
   };
 
   /**
-   * High-speed 5-worker parallel queue runner.
-   * Calls stateless /api/convert (Vercel Serverless compatible) with instant local fallback.
+   * High-speed 5-worker parallel 1:1 verbatim queue runner.
+   * 1. Extracts 100% of every page's exact lines, headings, tables, equations, and embedded images via pdfjs-dist.
+   * 2. Sends to stateless /api/convert for multimodal visual/LaTeX refinement without any summarization.
    */
   const runBatchWithConcurrency = async (
     items: Array<{
       job: PdfConversionJob;
+      rawFile?: File;
       pdfBase64?: string;
       presetId?: string;
     }>
@@ -123,11 +119,10 @@ export default function App() {
 
         setActiveWorkers((w) => w + 1);
         try {
-          // Stage 1: Fast Visual & Equation Scan
           updateSingleJob(item.job.id, {
             stage: 'analyzing_visual',
-            progress: 42,
-            stageDetail: 'Tahap 1: Memindai cepat foto halaman, gambar & rumus LaTeX...',
+            progress: 35,
+            stageDetail: 'Tahap 1: Ekstraksi 1:1 seluruh halaman, tabel, gambar & rumus...',
           });
 
           const preset = item.presetId
@@ -137,41 +132,50 @@ export default function App() {
               );
 
           if (preset) {
-            await new Promise((r) => setTimeout(r, 60));
+            await new Promise((r) => setTimeout(r, 50));
             updateSingleJob(item.job.id, {
               stage: 'reconciling_text',
-              progress: 84,
-              stageDetail: 'Tahap 2: Menyelaraskan hasil analisis visual & rumus dengan teks...',
+              progress: 82,
+              stageDetail: 'Tahap 2: Menyusun transkripsi 1:1 verbatim tanpa ringkasan...',
               pageCount: preset.pageCount,
               visualFindings: preset.visualElements,
             });
-            await new Promise((r) => setTimeout(r, 60));
-
-            const md = reconcileVisualAndTextToMarkdown({
-              title: preset.title,
-              originalName: item.job.originalName,
-              pageCount: preset.pageCount,
-              rawTextLayer: preset.rawTextLayer,
-              visualFindings: preset.visualElements,
-            });
+            await new Promise((r) => setTimeout(r, 50));
 
             updateSingleJob(item.job.id, {
               stage: 'completed',
               progress: 100,
-              stageDetail: 'Konversi selesai — Teks, Gambar & Equation LaTeX utuh',
+              stageDetail: 'Selesai — Transkripsi 1:1 Verbatim Utuh',
               pageCount: preset.pageCount,
               visualFindings: preset.visualElements,
-              markdownContent: md,
+              markdownContent: preset.rawTextLayer.trim(),
               completedAt: Date.now(),
             });
             continue;
           }
 
-          // For user-uploaded PDFs: call stateless /api/convert (Single-pass ThinkingLevel.LOW)
+          // Step 1: Extract exact 1:1 page-by-page verbatim text, tables, headings & equations via pdfjs-dist
+          let verbatimClientMarkdown = '';
+          let clientVisualFindings: VisualFinding[] = [];
+          let detectedPages = item.job.pageCount;
+
+          if (item.rawFile) {
+            try {
+              const extracted = await extractVerbatimPdfClient(item.rawFile);
+              verbatimClientMarkdown = extracted.verbatimMarkdown;
+              clientVisualFindings = extracted.visualFindings;
+              detectedPages = extracted.pageCount;
+            } catch {
+              // Fallback if PDF is encrypted or non-standard
+            }
+          }
+
           updateSingleJob(item.job.id, {
             stage: 'reconciling_text',
-            progress: 76,
-            stageDetail: 'Tahap 2: Menyelaraskan visual, rumus LaTeX & teks menjadi Markdown...',
+            progress: 78,
+            stageDetail: 'Tahap 2: Verifikasi 1:1 gambar & equation LaTeX dengan teks halaman...',
+            pageCount: detectedPages,
+            visualFindings: clientVisualFindings,
           });
 
           let converted: {
@@ -181,63 +185,62 @@ export default function App() {
             markdownContent: string;
           } | null = null;
 
+          // Only send base64 PDF to serverless endpoint if <= 3.5MB (safe for Vercel 4.5MB limit)
+          const safeBase64ForServer =
+            item.pdfBase64 && item.pdfBase64.length < 4_200_000 ? item.pdfBase64 : undefined;
+
           try {
             const res = await fetch('/api/convert', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 originalName: item.job.originalName,
-                pageCount: item.job.pageCount,
-                pdfBase64: item.pdfBase64,
-                presetId: item.presetId,
+                pageCount: detectedPages,
+                pdfBase64: safeBase64ForServer,
+                verbatimClientMarkdown,
+                clientVisualFindings,
               }),
             });
             if (res.ok) {
               converted = await res.json();
             }
           } catch {
-            // Instant client-side fallback if serverless endpoint is unreachable
+            // Instant client-side 1:1 verbatim fallback
           }
 
-          if (!converted && item.pdfBase64) {
-            const docTitle = item.job.originalName.replace(/\.pdf$/i, '').replace(/[_-]+/g, ' ');
-            const pdfBytes = base64ToUint8Array(item.pdfBase64);
-            const parsed = extractRawTextFromPdfBuffer(pdfBytes, docTitle);
-            const vf: VisualFinding[] = [
-              {
-                page: 1,
-                type: 'figure',
-                label: `Pemindaian Visual Halaman — ${docTitle}`,
-                content: `Struktur tata letak halaman PDF (${parsed.estimatedPages} halaman) telah dianalisis secara presisi.`,
-              },
-              {
-                page: 1,
-                type: 'equation',
-                label: 'Notasi & Formulasi Matematika Terdeteksi',
-                content:
-                  parsed.detectedEquations[0] ||
-                  '$$\\mathcal{F}(\\omega) = \\int_{-\\infty}^{\\infty} f(t)\\, e^{-i\\omega t}\\, dt$$',
-              },
-            ];
-            converted = {
-              title: docTitle,
-              pageCount: parsed.estimatedPages,
-              visualFindings: vf,
-              markdownContent: reconcileVisualAndTextToMarkdown({
+          if (!converted) {
+            if (verbatimClientMarkdown.trim().length > 0) {
+              const docTitle = item.job.originalName.replace(/\.pdf$/i, '').replace(/[_-]+/g, ' ');
+              converted = {
                 title: docTitle,
-                originalName: item.job.originalName,
+                pageCount: detectedPages,
+                visualFindings: clientVisualFindings,
+                markdownContent: verbatimClientMarkdown,
+              };
+            } else if (item.pdfBase64) {
+              const docTitle = item.job.originalName.replace(/\.pdf$/i, '').replace(/[_-]+/g, ' ');
+              const pdfBytes = base64ToUint8Array(item.pdfBase64);
+              const parsed = extractRawTextFromPdfBuffer(pdfBytes, docTitle);
+              converted = {
+                title: docTitle,
                 pageCount: parsed.estimatedPages,
-                rawTextLayer: parsed.extractedText,
-                visualFindings: vf,
-              }),
-            };
+                visualFindings: clientVisualFindings,
+                markdownContent: reconcileVisualAndTextToMarkdown({
+                  title: docTitle,
+                  originalName: item.job.originalName,
+                  pageCount: parsed.estimatedPages,
+                  rawTextLayer: parsed.extractedText,
+                  visualFindings: clientVisualFindings,
+                }),
+              };
+            }
           }
 
           if (converted) {
             updateSingleJob(item.job.id, {
               stage: 'completed',
               progress: 100,
-              stageDetail: 'Konversi selesai — Teks, Gambar & Equation LaTeX utuh',
+              stageDetail: 'Selesai — Transkripsi 1:1 Verbatim Utuh',
               pageCount: converted.pageCount,
               visualFindings: converted.visualFindings,
               markdownContent: converted.markdownContent,
@@ -280,7 +283,7 @@ export default function App() {
 
     try {
       const now = Date.now();
-      const batchItems: Array<{ job: PdfConversionJob; pdfBase64: string }> = [];
+      const batchItems: Array<{ job: PdfConversionJob; rawFile: File; pdfBase64: string }> = [];
 
       for (let i = 0; i < fileList.length; i++) {
         const f = fileList[i];
@@ -295,29 +298,29 @@ export default function App() {
           originalName: f.name,
           outputName: sanitizeOutputFilename(rawOut, '.md'),
           fileSizeBytes: f.size || 180_000,
-          pageCount: Math.max(1, Math.min(24, Math.ceil((f.size || 120_000) / 65_000))),
+          pageCount: Math.max(1, Math.min(50, Math.ceil((f.size || 120_000) / 65_000))),
           stage: 'queued',
           progress: 0,
-          stageDetail: 'Menunggu giliran di antrean turbo...',
+          stageDetail: 'Menunggu giliran di antrean 1:1...',
           includeInMerge: true,
           visualFindings: [],
           markdownContent: '',
           createdAt: now + i,
         };
 
-        batchItems.push({ job: newJob, pdfBase64: base64 });
+        batchItems.push({ job: newJob, rawFile: f, pdfBase64: base64 });
       }
 
       setJobs((prev) => [...prev, ...batchItems.map((b) => b.job)]);
       setSelectedJobId(batchItems[0].job.id);
       setStatusBanner(
-        `Memproses ${batchItems.length} file PDF secara paralel (${concurrency} worker turbo aktif)...`
+        `Mengekstraksi 1:1 isi lengkap dari ${batchItems.length} file PDF (${concurrency} worker paralel)...`
       );
       setIsUploading(false);
 
       await runBatchWithConcurrency(batchItems);
       setStatusBanner(
-        `${batchItems.length} file PDF selesai dikonversi dengan presisi penuh.`
+        `${batchItems.length} file PDF selesai ditranskripsi 1:1 ke Markdown tanpa ada yang diringkas.`
       );
     } finally {
       setIsUploading(false);
@@ -346,7 +349,7 @@ export default function App() {
         pageCount: p.pageCount,
         stage: 'queued',
         progress: 0,
-        stageDetail: 'Menunggu giliran di antrean turbo...',
+        stageDetail: 'Menunggu giliran di antrean 1:1...',
         includeInMerge: true,
         visualFindings: [],
         markdownContent: '',
@@ -360,12 +363,12 @@ export default function App() {
     setSelectedJobId(batchItems[0]?.job.id || null);
     setIsUploading(false);
     setStatusBanner(
-      `Batch ${batchItems.length} file PDF sedang diproses paralel (${concurrency} worker turbo)...`
+      `Batch ${batchItems.length} file PDF sedang ditranskripsi 1:1 paralel (${concurrency} worker)...`
     );
 
     await runBatchWithConcurrency(batchItems);
     setStatusBanner(
-      `Seluruh ${batchItems.length} file PDF selesai dikonversi ke Markdown utuh dan siap diunduh.`
+      `Seluruh ${batchItems.length} file PDF selesai ditranskripsi 1:1 ke Markdown utuh (tanpa ringkasan) dan siap diunduh.`
     );
   };
 
@@ -393,7 +396,6 @@ export default function App() {
     setStatusBanner('Seluruh daftar antrean telah dibersihkan.');
   };
 
-  // Trigger browser download for a single .md string
   const triggerTextDownload = (filename: string, content: string) => {
     const safeName = sanitizeOutputFilename(filename, '.md');
     const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' });
@@ -407,7 +409,6 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
-  // Instant collective ZIP generation & download (works offline, on Vercel, and on Express)
   const handleDownloadCollectiveZip = () => {
     const completedJobs = jobs.filter((j) => j.stage === 'completed' && j.markdownContent);
     if (completedJobs.length === 0) return;
@@ -440,7 +441,7 @@ export default function App() {
       a.remove();
       URL.revokeObjectURL(url);
       setStatusBanner(
-        `Arsip kolektif "${cleanZip}" (${completedJobs.length} file Markdown) berhasil diunduh secara instan.`
+        `Arsip kolektif "${cleanZip}" (${completedJobs.length} file Markdown 1:1) berhasil diunduh secara instan.`
       );
     } finally {
       setIsDownloadingZip(false);
@@ -512,7 +513,7 @@ export default function App() {
             href="#inspeksi-markdown"
             className="hover:text-slate-900 transition-colors whitespace-nowrap shrink-0"
           >
-            Pratinjau Hasil
+            Pratinjau 1:1
           </a>
         </nav>
 
@@ -538,25 +539,25 @@ export default function App() {
           <div className="lg:col-span-7 bg-white border border-slate-200 rounded-xl p-6 flex flex-col justify-between">
             <div>
               <p className="text-xs font-medium text-blue-700 mb-2">
-                Engine Turbo Single-Pass · 5 Worker Paralel · Kompatibel Penuh dengan Vercel
+                Transkripsi 1:1 Verbatim Tanpa Ringkasan · Ekstraksi Halaman, Gambar, Tabel & LaTeX
               </p>
               <h1
                 className="text-2xl sm:text-3xl font-bold text-slate-900 tracking-tight"
                 style={{ textWrap: 'balance' }}
               >
-                Analisis Visual Halaman & Persamaan Matematika Cepat Tanpa Terlewat
+                Konversi PDF ke Markdown 1:1 Persis Tanpa Diringkas
               </h1>
               <p className="text-sm text-slate-600 mt-3 leading-relaxed max-w-2xl">
-                Memindai foto halaman, diagram, tabel, dan rumus LaTeX sekaligus menyelaraskannya
-                dengan lapisan teks PDF dalam satu lintasan cepat (Single-Pass Turbo). Mendukung
-                pemrosesan 10+ file sekaligus menjadi Markdown terpisah, penggabungan otomatis
-                (Auto-Merge), dan pengemasan ZIP instan.
+                Mengekstraksi setiap halaman PDF secara 1:1 kata demi kata sesuai urutan aslinya:
+                seluruh judul, subjudul, paragraf lengkap, tabel baris demi baris, rumus matematika
+                LaTeX (<code>$$...$$</code>), serta deskripsi gambar tepat pada posisi halamannya
+                tanpa pemotongan atau peringkasan.
               </p>
             </div>
 
             <div className="mt-6 pt-5 border-t border-slate-100 flex flex-wrap items-center justify-between gap-4">
               <div className="text-xs text-slate-500">
-                <span>Uji kecepatan antrean paralel dengan 10 dokumen PDF ilmiah sekaligus:</span>
+                <span>Uji kecepatan transkripsi 1:1 paralel dengan 10 dokumen PDF sekaligus:</span>
               </div>
               <div className="flex flex-wrap items-center gap-2.5">
                 <button
@@ -598,7 +599,7 @@ export default function App() {
                   Klik untuk memilih banyak file PDF atau seret ke sini
                 </span>
                 <span className="text-xs text-slate-500 mt-1">
-                  Mendukung pemilihan 10+ file PDF sekaligus · Output .MD terpisah + Arsip .ZIP
+                  Transkripsi 1:1 halaman demi halaman · Output .MD terpisah + Arsip .ZIP
                 </span>
                 <input
                   ref={fileInputRef}
@@ -699,7 +700,6 @@ export default function App() {
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-5 pt-5">
-            {/* Custom ZIP Filename */}
             <div>
               <label
                 htmlFor="custom-zip-name"
@@ -722,7 +722,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* Custom Merged Markdown Filename */}
             <div>
               <label
                 htmlFor="custom-merged-name"
@@ -745,7 +744,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* Custom Merged Document Header Title */}
             <div>
               <label
                 htmlFor="custom-merged-title"
@@ -758,7 +756,7 @@ export default function App() {
                 type="text"
                 value={mergedDocTitle}
                 onChange={(e) => setMergedDocTitle(e.target.value)}
-                placeholder="Kompilasi Dokumen Riset & Teknis"
+                placeholder="Kompilasi Dokumen 1:1 Verbatim"
                 className="w-full px-3 py-2 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-none focus:border-blue-500"
               />
             </div>
@@ -768,7 +766,7 @@ export default function App() {
           <div className="mt-5 pt-4 border-t border-slate-100 flex flex-wrap items-center justify-between gap-4">
             <div className="flex items-center gap-2 text-xs text-slate-600 tabular-nums">
               <span>Siap diunduh:</span>
-              <strong className="text-slate-900">{stats.completed} file .MD terpisah</strong>
+              <strong className="text-slate-900">{stats.completed} file .MD 1:1 terpisah</strong>
               <span aria-hidden="true">·</span>
               <span>
                 {jobs.filter((j) => j.stage === 'completed' && j.includeInMerge).length} file
@@ -828,12 +826,11 @@ export default function App() {
           id="antrean-konversi"
           className="bg-white border border-slate-200 rounded-xl overflow-hidden"
         >
-          {/* Queue Header & Overall Batch Progress */}
           <div className="p-5 border-b border-slate-200 space-y-4">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
               <div>
                 <h2 className="text-base font-semibold text-slate-900">
-                  Sistem Antrean Paralel & Progres Konversi Per File
+                  Sistem Antrean Paralel & Progres Transkripsi 1:1 Per File
                 </h2>
                 <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 mt-1 tabular-nums">
                   <span>Total: {stats.total} file</span>
@@ -850,7 +847,6 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Filter & Clear Controls */}
               <div className="flex flex-wrap items-center gap-2.5">
                 <div className="relative">
                   <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
@@ -913,7 +909,6 @@ export default function App() {
               </div>
             </div>
 
-            {/* Aggregate Batch Progress Bar */}
             <div>
               <div className="flex items-center justify-between text-xs mb-1.5 tabular-nums">
                 <span className="font-medium text-slate-700">
@@ -937,7 +932,6 @@ export default function App() {
             </div>
           </div>
 
-          {/* Queue Rows List */}
           {filteredJobs.length === 0 ? (
             <div className="p-10 text-center">
               <Layers className="w-8 h-8 text-slate-400 mx-auto mb-2" />
@@ -945,7 +939,7 @@ export default function App() {
                 Belum ada file PDF pada tampilan antrean ini
               </p>
               <p className="text-xs text-slate-500 mt-1 max-w-md mx-auto">
-                Unggah banyak file PDF Anda di atas atau gunakan tombol simulasi batch 10 file PDF untuk melihat antrean konversi bekerja.
+                Unggah banyak file PDF Anda di atas atau gunakan tombol simulasi batch 10 file PDF untuk melihat transkripsi 1:1 bekerja.
               </p>
               <button
                 type="button"
@@ -983,14 +977,13 @@ export default function App() {
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
             <div>
               <h2 className="text-base font-semibold text-slate-900">
-                Inspeksi Hasil Markdown (Dokumen Terpisah & Dokumen Gabungan Utuh)
+                Inspeksi Hasil Markdown 1:1 (Dokumen Terpisah & Dokumen Gabungan Utuh)
               </h2>
               <p className="text-xs text-slate-500 mt-0.5">
-                Periksa hasil ekstraksi gambar halaman, rumus LaTeX, dan tabel per file atau lihat hasil penggabungan otomatis.
+                Isi dokumen ditampilkan 1:1 halaman demi halaman persis seperti file PDF aslinya (tanpa diringkas).
               </p>
             </div>
 
-            {/* Segmented Mode Selector: Separate File vs Merged Document */}
             <div className="flex items-center gap-1 p-1 bg-slate-200/80 rounded-lg self-start">
               <button
                 type="button"
@@ -1024,11 +1017,10 @@ export default function App() {
 
           {activeTab === 'single' ? (
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-              {/* Left 4 Cols: Completed Files Selector List */}
               <div className="lg:col-span-4 bg-white border border-slate-200 rounded-xl overflow-hidden">
                 <div className="px-4 py-3 bg-slate-50 border-b border-slate-200 flex items-center justify-between">
                   <span className="text-xs font-semibold text-slate-800">
-                    Pilih File Markdown Terpisah
+                    Pilih File Markdown 1:1 Terpisah
                   </span>
                   <span className="text-xs text-slate-500 tabular-nums">
                     {stats.completed} selesai
@@ -1058,7 +1050,7 @@ export default function App() {
                               {idx + 1}. {j.outputName}
                             </div>
                             <div className="text-xs text-slate-500 truncate mt-0.5">
-                              Sumber: {j.originalName} · {j.pageCount} hal
+                              Sumber: {j.originalName} · {j.pageCount} hal (1:1 Utuh)
                             </div>
                           </div>
                           <span className="text-xs font-mono text-slate-400 shrink-0">→</span>
@@ -1068,20 +1060,19 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Right 8 Cols: Selected File Markdown Viewer */}
               <div className="lg:col-span-8">
                 {selectedJob && selectedJob.stage === 'completed' ? (
                   <MarkdownViewer
                     markdown={selectedJob.markdownContent}
                     filename={selectedJob.outputName}
-                    subtitle={`Sumber PDF: ${selectedJob.originalName} · ${selectedJob.pageCount} halaman · ${selectedJob.visualFindings.length} elemen visual & rumus terverifikasi`}
+                    subtitle={`Sumber PDF: ${selectedJob.originalName} · ${selectedJob.pageCount} halaman · Transkripsi 1:1 Verbatim (Tanpa Ringkasan)`}
                     onDownload={() =>
                       triggerTextDownload(selectedJob.outputName, selectedJob.markdownContent)
                     }
                   />
                 ) : (
                   <div className="bg-white border border-slate-200 rounded-xl p-10 text-center text-xs text-slate-500">
-                    Pilih salah satu file yang telah selesai dikonversi untuk melihat pratinjau Markdown dan rumus LaTeX.
+                    Pilih salah satu file yang telah selesai dikonversi untuk melihat transkripsi 1:1 Markdown dan rumus LaTeX.
                   </div>
                 )}
               </div>
@@ -1092,9 +1083,9 @@ export default function App() {
                 <MarkdownViewer
                   markdown={mergedMarkdown}
                   filename={`${mergedFilename.trim().replace(/\.md$/i, '') || 'dokumen-gabungan-lengkap'}.md`}
-                  subtitle={`Digabungkan otomatis dari ${
+                  subtitle={`Digabungkan otomatis 1:1 dari ${
                     jobs.filter((j) => j.stage === 'completed' && j.includeInMerge).length
-                  } dokumen Markdown terpisah`}
+                  } dokumen Markdown terpisah (Tanpa Ringkasan)`}
                   onDownload={() =>
                     triggerTextDownload(
                       `${mergedFilename.trim().replace(/\.md$/i, '') || 'dokumen-gabungan-lengkap'}.md`,
@@ -1112,11 +1103,10 @@ export default function App() {
         </section>
       </main>
 
-      {/* Clean Footer */}
       <footer className="border-t border-slate-200 bg-white px-6 py-4 mt-12">
         <div className="max-w-[1360px] mx-auto flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-slate-500">
           <span>
-            DocuForge MD — Studio Konversi Batch PDF ke Markdown & Rekonsiliasi Rumus LaTeX
+            DocuForge MD — Studio Transkripsi Batch PDF ke Markdown 1:1 Verbatim & Rumus LaTeX
           </span>
           <div className="flex items-center gap-4">
             <a href="#unggah-batch" className="hover:text-slate-900">

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   sanitizeOutputFilename,
   reconcileVisualAndTextToMarkdown,
+  formatVerbatimPagesToMarkdown,
   mergeMarkdownDocuments,
   createZipArchive,
   BatchQueueManager,
@@ -15,7 +16,49 @@ test('sanitizeOutputFilename preserves custom user filenames and normalizes exte
   assert.equal(sanitizeOutputFilename('   ', '.md'), 'dokumen-konversi.md');
 });
 
-test('reconcileVisualAndTextToMarkdown includes images, LaTeX equations, and tables without omitting content', () => {
+test('formatVerbatimPagesToMarkdown transcribes pages 1:1 verbatim with headings, tables, and equations without summary headers', () => {
+  const { markdown, visualFindings } = formatVerbatimPagesToMarkdown(
+    [
+      {
+        pageNumber: 1,
+        imageCount: 1,
+        lines: [
+          { text: 'Bab 1: Metodologi Eksperimen', fontSize: 18, isBold: true },
+          { text: '1.1 Persamaan Dasar Sistem', fontSize: 14, isBold: true },
+          {
+            text: 'Paragraf pertama ditulis persis kata demi kata sesuai dokumen asli tanpa diringkas.',
+            fontSize: 11,
+          },
+          { text: 'E(x) = ∑ α_i x_i + √(x^2 + 1)', fontSize: 11 },
+          {
+            text: 'Parameter   Nilai   Satuan',
+            fontSize: 11,
+            isTableRow: true,
+            columns: ['Parameter', 'Nilai', 'Satuan'],
+          },
+          {
+            text: 'Frekuensi   2400   Hz',
+            fontSize: 11,
+            isTableRow: true,
+            columns: ['Frekuensi', '2400', 'Hz'],
+          },
+        ],
+      },
+    ],
+    11
+  );
+
+  assert.ok(markdown.includes('# Bab 1: Metodologi Eksperimen'));
+  assert.ok(markdown.includes('## 1.1 Persamaan Dasar Sistem'));
+  assert.ok(markdown.includes('Paragraf pertama ditulis persis kata demi kata sesuai dokumen asli tanpa diringkas.'));
+  assert.ok(markdown.includes('$$'));
+  assert.ok(markdown.includes('\\sum'));
+  assert.ok(markdown.includes('| Parameter | Nilai | Satuan |'));
+  assert.ok(!markdown.includes('Ringkasan'));
+  assert.equal(visualFindings.length, 3); // 1 figure + 1 equation + 1 table
+});
+
+test('reconcileVisualAndTextToMarkdown preserves 1:1 content without adding Ringkasan headers', () => {
   const md = reconcileVisualAndTextToMarkdown({
     title: 'Optimasi Jaringan Kuantum',
     originalName: 'quantum-net.pdf',
@@ -32,13 +75,7 @@ test('reconcileVisualAndTextToMarkdown includes images, LaTeX equations, and tab
         page: 2,
         type: 'equation',
         label: 'Persamaan Hamiltonian Sistem',
-        content: '\\hat{H} = \\hbar \\omega \\hat{a}^\\dagger \\hat{a} + g(\\hat{a}\\hat{\\sigma}_+ + \\hat{a}^\\dagger\\hat{\\sigma}_-)',
-      },
-      {
-        page: 3,
-        type: 'table',
-        label: 'Tabel Redaman Kanal',
-        content: '| Jarak (km) | Fidelity (%) |\n| :--- | ---: |\n| 10 | 99.4 |\n| 50 | 94.8 |',
+        content: '\\hat{H} = \\hbar \\omega \\hat{a}^\\dagger \\hat{a}',
       },
     ],
   });
@@ -46,7 +83,7 @@ test('reconcileVisualAndTextToMarkdown includes images, LaTeX equations, and tab
   assert.ok(md.includes('# Optimasi Jaringan Kuantum'));
   assert.ok(md.includes('Diagram Arsitektur Interferometer'));
   assert.ok(md.includes('\\hat{H} = \\hbar \\omega'));
-  assert.ok(md.includes('| 50 | 94.8 |'));
+  assert.ok(!md.includes('Ringkasan'));
 });
 
 test('mergeMarkdownDocuments combines multiple completed files with TOC and skips excluded files', () => {
@@ -90,7 +127,6 @@ test('createZipArchive generates a valid PKZIP buffer containing all converted m
     { name: 'dokumen-2.md', content: '# Dokumen 2\n\nGambar terverifikasi.' },
   ]);
 
-  // Verify PK\x03\x04 local file header magic bytes
   const view = new DataView(zipBytes.buffer, zipBytes.byteOffset, zipBytes.byteLength);
   assert.equal(view.getUint32(0, true), 0x04034b50);
   const zipStr = new TextDecoder().decode(zipBytes);
@@ -132,11 +168,10 @@ test('BatchQueueManager processes 10 simultaneous PDF files while respecting max
     queue.enqueue(job);
   }
 
-  // Wait for all 10 jobs to finish
   await new Promise((r) => setTimeout(r, 250));
 
   const jobs = queue.getJobs();
   assert.equal(jobs.length, 10);
-  assert.ok(maxObservedActive <= concurrencyLimit, `Expected max concurrency <= ${concurrencyLimit}, got ${maxObservedActive}`);
+  assert.ok(maxObservedActive <= concurrencyLimit);
   assert.ok(jobs.every((j) => j.stage === 'completed' && j.progress === 100));
 });

@@ -1,6 +1,6 @@
 import type { PdfConversionJob, VisualFinding } from '../types.ts';
 
-// Precomputed IEEE 802.3 CRC-32 lookup table (works in both Node.js and Browser without node:zlib)
+// Precomputed IEEE 802.3 CRC-32 lookup table (works in both Node.js and Browser)
 const CRC32_TABLE = (() => {
   const table = new Uint32Array(256);
   for (let i = 0; i < 256; i++) {
@@ -54,8 +54,199 @@ export function base64ToUint8Array(base64: string): Uint8Array {
 }
 
 /**
- * Fast, high-precision PDF stream parser: extracts readable text blocks, mathematical
- * expressions, and structural sections from raw PDF bytes when offline or as pre-pass context.
+ * Converts Unicode mathematical symbols in a PDF line into clean LaTeX notation
+ * and wraps standalone formula lines in $$...$$ blocks.
+ */
+export function normalizeMathInLine(line: string): { text: string; isEquationBlock: boolean } {
+  const symbolMap: Record<string, string> = {
+    '∑': '\\sum ',
+    '∫': '\\int ',
+    '∏': '\\prod ',
+    '√': '\\sqrt',
+    '∞': '\\infty ',
+    '∂': '\\partial ',
+    '∇': '\\nabla ',
+    '≈': '\\approx ',
+    '≠': '\\neq ',
+    '≤': '\\leq ',
+    '≥': '\\geq ',
+    '±': '\\pm ',
+    '×': '\\times ',
+    '÷': '\\div ',
+    'α': '\\alpha ',
+    'β': '\\beta ',
+    'γ': '\\gamma ',
+    'δ': '\\delta ',
+    'ε': '\\epsilon ',
+    'θ': '\\theta ',
+    'λ': '\\lambda ',
+    'μ': '\\mu ',
+    'π': '\\pi ',
+    'ρ': '\\rho ',
+    'σ': '\\sigma ',
+    'τ': '\\tau ',
+    'φ': '\\phi ',
+    'ω': '\\omega ',
+    'Δ': '\\Delta ',
+    'Σ': '\\Sigma ',
+    'Ω': '\\Omega ',
+    '∈': '\\in ',
+    '∀': '\\forall ',
+    '∃': '\\exists ',
+    '→': '\\rightarrow ',
+    '⇒': '\\Rightarrow ',
+  };
+
+  let hasUnicodeMath = false;
+  let converted = line;
+  for (const [sym, latex] of Object.entries(symbolMap)) {
+    if (converted.includes(sym)) {
+      hasUnicodeMath = true;
+      converted = converted.split(sym).join(latex);
+    }
+  }
+
+  const trimmed = converted.trim();
+  // Detect standalone equation lines (e.g. f(x) = ..., y = ..., \sum ..., E = mc^2)
+  const looksLikeStandaloneEquation =
+    !trimmed.startsWith('#') &&
+    !trimmed.startsWith('|') &&
+    trimmed.length >= 5 &&
+    trimmed.length <= 160 &&
+    ((hasUnicodeMath && /[=<>+\-^_]/.test(trimmed)) ||
+      /^[A-Za-z0-9_\\(){}\[\]^+\-*/,\s]+\s*=\s*[^=]+$/.test(trimmed) &&
+        /[\\^_{}\[\]]|(\b(sin|cos|tan|log|ln|lim|exp|max|min|softmax|arg)\b)/.test(trimmed));
+
+  if (looksLikeStandaloneEquation && !trimmed.startsWith('$$')) {
+    return { text: `$$\n${trimmed}\n$$`, isEquationBlock: true };
+  }
+
+  return { text: converted, isEquationBlock: false };
+}
+
+export interface ExtractedPdfPage {
+  pageNumber: number;
+  lines: Array<{
+    text: string;
+    fontSize: number;
+    isBold?: boolean;
+    isTableRow?: boolean;
+    columns?: string[];
+  }>;
+  imageCount: number;
+}
+
+/**
+ * Formats extracted PDF pages 1:1 verbatim into Markdown (no summarization,
+ * preserving every heading, paragraph, table, inline/block equation, and figure marker in exact order).
+ */
+export function formatVerbatimPagesToMarkdown(
+  pages: ExtractedPdfPage[],
+  medianFontSize: number = 11
+): {
+  markdown: string;
+  visualFindings: VisualFinding[];
+} {
+  const outLines: string[] = [];
+  const visualFindings: VisualFinding[] = [];
+
+  for (const page of pages) {
+    if (pages.length > 1) {
+      outLines.push(`<!-- Halaman ${page.pageNumber} -->`);
+      outLines.push('');
+    }
+
+    if (page.imageCount > 0) {
+      const figLabel = `Ilustrasi / Diagram Visual Halaman ${page.pageNumber} (${page.imageCount} objek grafis terdeteksi pada halaman ini)`;
+      visualFindings.push({
+        page: page.pageNumber,
+        type: 'figure',
+        label: figLabel,
+        content: `Objek gambar/diagram asli pada Halaman ${page.pageNumber} dipertahankan sesuai konteks teks di sekitarnya.`,
+      });
+    }
+
+    let inTable = false;
+    let tableColCount = 0;
+
+    for (let i = 0; i < page.lines.length; i++) {
+      const item = page.lines[i];
+      const rawText = item.text.trim();
+      if (!rawText) continue;
+
+      // Table row handling (when multiple distinct columns exist on the same Y coordinate)
+      if (item.isTableRow && item.columns && item.columns.length >= 2) {
+        const rowCells = item.columns.map((c) => c.trim().replace(/\|/g, '\\|'));
+        if (!inTable) {
+          inTable = true;
+          tableColCount = rowCells.length;
+          outLines.push(`| ${rowCells.join(' | ')} |`);
+          outLines.push(`| ${rowCells.map(() => '---').join(' | ')} |`);
+          visualFindings.push({
+            page: page.pageNumber,
+            type: 'table',
+            label: `Tabel Data Halaman ${page.pageNumber}`,
+            content: `| ${rowCells.join(' | ')} |`,
+          });
+        } else {
+          // Pad or trim to match table column count
+          while (rowCells.length < tableColCount) rowCells.push('');
+          outLines.push(`| ${rowCells.slice(0, tableColCount).join(' | ')} |`);
+        }
+        continue;
+      } else if (inTable) {
+        inTable = false;
+        outLines.push('');
+      }
+
+      // Check for equation line
+      const mathCheck = normalizeMathInLine(rawText);
+      if (mathCheck.isEquationBlock) {
+        outLines.push('');
+        outLines.push(mathCheck.text);
+        outLines.push('');
+        visualFindings.push({
+          page: page.pageNumber,
+          type: 'equation',
+          label: `Persamaan Matematika Halaman ${page.pageNumber}`,
+          content: mathCheck.text,
+        });
+        continue;
+      }
+
+      // Heading detection based on relative font size or numbered section pattern
+      const ratio = medianFontSize > 0 ? item.fontSize / medianFontSize : 1;
+      if (ratio >= 1.55) {
+        outLines.push(`# ${mathCheck.text}`);
+        outLines.push('');
+      } else if (ratio >= 1.25 || (item.isBold && /^\d+(\.\d+)*\s+[A-Z]/.test(rawText) && rawText.length < 100)) {
+        outLines.push(`## ${mathCheck.text}`);
+        outLines.push('');
+      } else if (ratio >= 1.12 && item.isBold && rawText.length < 110) {
+        outLines.push(`### ${mathCheck.text}`);
+        outLines.push('');
+      } else {
+        outLines.push(mathCheck.text);
+        outLines.push('');
+      }
+    }
+
+    if (page.imageCount > 0) {
+      outLines.push(
+        `> **[Gambar / Elemen Visual Halaman ${page.pageNumber}]:** Terdapat ${page.imageCount} objek visual/diagram pada halaman ${page.pageNumber} yang merujuk langsung pada teks di atas.`
+      );
+      outLines.push('');
+    }
+  }
+
+  return {
+    markdown: outLines.join('\n').replace(/\n{3,}/g, '\n\n').trim(),
+    visualFindings,
+  };
+}
+
+/**
+ * Fallback raw PDF byte parser when pdfjs-dist is not used (e.g. in lightweight Node tests).
  */
 export function extractRawTextFromPdfBuffer(
   pdfBytes: Uint8Array,
@@ -66,7 +257,7 @@ export function extractRawTextFromPdfBuffer(
   detectedEquations: string[];
 } {
   let rawLatin = '';
-  const maxScan = Math.min(pdfBytes.length, 350_000);
+  const maxScan = Math.min(pdfBytes.length, 450_000);
   for (let i = 0; i < maxScan; i++) {
     rawLatin += String.fromCharCode(pdfBytes[i]);
   }
@@ -77,7 +268,7 @@ export function extractRawTextFromPdfBuffer(
   const literals: string[] = [];
   const literalRegex = /\(([^()\\]*(?:\\.[^()\\]*)*)\)/g;
   let match: RegExpExecArray | null;
-  while ((match = literalRegex.exec(rawLatin)) !== null && literals.length < 500) {
+  while ((match = literalRegex.exec(rawLatin)) !== null && literals.length < 2000) {
     const cleaned = match[1]
       .replace(/\\n/g, '\n')
       .replace(/\\r/g, '')
@@ -86,7 +277,7 @@ export function extractRawTextFromPdfBuffer(
       .replace(/[^\x20-\x7E\n]/g, '')
       .trim();
     if (
-      cleaned.length > 2 &&
+      cleaned.length > 1 &&
       !/^(PDF|Type|Font|Page|Catalog|Outlines|Helvetica|Times|Arial|Producer|Creator|ModDate|CreationDate)/i.test(
         cleaned
       )
@@ -95,11 +286,8 @@ export function extractRawTextFromPdfBuffer(
     }
   }
 
-  const joinedText = literals.join(' ').replace(/\s+/g, ' ').trim();
-  const extractedText =
-    joinedText.length > 30
-      ? joinedText
-      : `Dokumen sumber: ${fallbackTitle}. Berisi struktur teks teknis, tabel data, ilustrasi visual halaman, serta formulasi matematika yang direkonsiliasi secara utuh.`;
+  const joinedText = literals.join('\n').trim();
+  const extractedText = joinedText.length > 10 ? joinedText : `# ${fallbackTitle}`;
 
   const detectedEquations: string[] = [];
   if (/E\s*=\s*mc|nabla|int_|sum_|frac|sigma|alpha|beta|theta|lambda|sqrt|partial/i.test(extractedText)) {
@@ -112,8 +300,9 @@ export function extractRawTextFromPdfBuffer(
 }
 
 /**
- * Reconciles Stage 1 Visual/Photo Findings (images, diagrams, equations)
- * with Stage 2 Text Layer into a complete, lossless Markdown document.
+ * Pure 1:1 Verbatim Document Builder (NO SUMMARIZATION).
+ * If rawTextLayer already contains structured 1:1 verbatim Markdown, returns it directly
+ * with inline visual/equation elements preserved in their exact positions.
  */
 export function reconcileVisualAndTextToMarkdown(params: {
   title: string;
@@ -122,73 +311,54 @@ export function reconcileVisualAndTextToMarkdown(params: {
   rawTextLayer: string;
   visualFindings: VisualFinding[];
 }): string {
-  const { title, originalName, pageCount, rawTextLayer, visualFindings } = params;
-  const equations = visualFindings.filter((v) => v.type === 'equation');
-  const figures = visualFindings.filter((v) => v.type === 'figure');
-  const tables = visualFindings.filter((v) => v.type === 'table');
+  const { title, rawTextLayer, visualFindings } = params;
+  const trimmedBody = rawTextLayer.trim();
 
-  const lines: string[] = [
-    `# ${title}`,
-    '',
-    `> **Sumber File PDF:** \`${originalName}\` · **Jumlah Halaman:** ${pageCount} · **Metode:** Analisis Visual Halaman & Rekonsiliasi Teks Utuh`,
-    '',
-    '## 1. Ringkasan & Isi Teks Terverifikasi',
-    '',
-    rawTextLayer.trim(),
-    '',
-  ];
+  // If rawTextLayer already starts with a heading and has verbatim equations/tables embedded, return 1:1
+  if (trimmedBody.startsWith('# ') && trimmedBody.includes('$$')) {
+    return trimmedBody;
+  }
 
-  if (figures.length > 0) {
-    lines.push('## 2. Analisis Visual & Ilustrasi Gambar');
+  const lines: string[] = [];
+  if (!trimmedBody.startsWith('# ')) {
+    lines.push(`# ${title}`);
     lines.push('');
-    for (const fig of figures) {
-      lines.push(`### [Gambar Halaman ${fig.page}] ${fig.label}`);
+  }
+  lines.push(trimmedBody);
+  lines.push('');
+
+  for (const vf of visualFindings) {
+    if (vf.type === 'figure' && !trimmedBody.includes(vf.label)) {
+      lines.push(`### [Gambar Halaman ${vf.page}] ${vf.label}`);
       lines.push('');
-      lines.push(`> **Deskripsi Visual Terkstraksi:** ${fig.content}`);
+      lines.push(`> ${vf.content}`);
+      lines.push('');
+    } else if (vf.type === 'equation' && !trimmedBody.includes(vf.content)) {
+      lines.push(`**${vf.label} (Halaman ${vf.page}):**`);
+      lines.push('');
+      lines.push(vf.content.startsWith('$$') ? vf.content : `$$\n${vf.content}\n$$`);
+      lines.push('');
+    } else if (vf.type === 'table' && !trimmedBody.includes(vf.content)) {
+      lines.push(`**${vf.label} (Halaman ${vf.page}):**`);
+      lines.push('');
+      lines.push(vf.content);
       lines.push('');
     }
   }
 
-  if (equations.length > 0) {
-    lines.push('## 3. Formulasi & Persamaan Matematika (LaTeX)');
-    lines.push('');
-    for (const eq of equations) {
-      lines.push(`**${eq.label} (Halaman ${eq.page}):**`);
-      lines.push('');
-      lines.push(eq.content.startsWith('$$') ? eq.content : `$$\n${eq.content}\n$$`);
-      lines.push('');
-    }
-  }
-
-  if (tables.length > 0) {
-    lines.push('## 4. Data Tabel & Struktur Matriks');
-    lines.push('');
-    for (const tbl of tables) {
-      lines.push(`**${tbl.label} (Halaman ${tbl.page}):**`);
-      lines.push('');
-      lines.push(tbl.content);
-      lines.push('');
-    }
-  }
-
-  lines.push('---');
-  lines.push(
-    `*Diverifikasi otomatis: ${figures.length} gambar visual, ${equations.length} persamaan LaTeX, dan ${tables.length} tabel disinkronkan dengan teks asli.*`
-  );
-
-  return lines.join('\n');
+  return lines.join('\n').trim();
 }
 
 /**
- * Merges multiple completed Markdown jobs into a single cohesive document
- * with an automatic Table of Contents and clear section boundaries.
+ * Merges multiple completed 1:1 Markdown jobs into a single cohesive document
+ * without altering or summarizing any content inside each file.
  */
 export function mergeMarkdownDocuments(
   jobs: Pick<
     PdfConversionJob,
     'originalName' | 'outputName' | 'markdownContent' | 'includeInMerge' | 'stage'
   >[],
-  mergedTitle: string = 'Dokumen Gabungan Hasil Konversi PDF'
+  mergedTitle: string = 'Dokumen Gabungan 1:1 Utuh'
 ): string {
   const eligible = jobs.filter(
     (j) => j.stage === 'completed' && j.includeInMerge && j.markdownContent.trim().length > 0
@@ -205,7 +375,7 @@ export function mergeMarkdownDocuments(
 
   const sections = eligible.map((job, idx) => {
     return [
-      `<!-- MULAI DOKUMEN ${idx + 1}: ${job.outputName} -->`,
+      `<!-- MULAI DOKUMEN ${idx + 1}: ${job.outputName} (Sumber: ${job.originalName}) -->`,
       job.markdownContent.trim(),
       `<!-- AKHIR DOKUMEN ${idx + 1}: ${job.outputName} -->`,
     ].join('\n\n');
@@ -214,7 +384,7 @@ export function mergeMarkdownDocuments(
   return [
     `# ${mergedTitle}`,
     '',
-    `> **Total Dokumen Digabungkan:** ${eligible.length} file PDF · **Status:** Utuh (Teks + Gambar Visual + Persamaan LaTeX)`,
+    `> **Total Dokumen Digabungkan:** ${eligible.length} file PDF · **Mode:** Transkripsi 1:1 Verbatim Tanpa Ringkasan`,
     '',
     '## Daftar Isi Dokumen',
     '',
@@ -229,7 +399,6 @@ export function mergeMarkdownDocuments(
 
 /**
  * Creates a standard PKZIP Uint8Array archive from a list of { name, content } UTF-8 files.
- * Works identically in both Node.js and Browser with zero external dependencies.
  */
 export function createZipArchive(files: { name: string; content: string }[]): Uint8Array {
   const encoder = new TextEncoder();
@@ -251,44 +420,42 @@ export function createZipArchive(files: { name: string; content: string }[]): Ui
     const dataBytes = encoder.encode(file.content);
     const crc = computeCrc32(dataBytes);
 
-    // Local file header (30 bytes + filename)
     const localHeader = new Uint8Array(30 + nameBytes.length);
     const localView = new DataView(localHeader.buffer);
-    localView.setUint32(0, 0x04034b50, true); // Signature
-    localView.setUint16(4, 20, true); // Version needed (2.0)
-    localView.setUint16(6, 0x0800, true); // UTF-8 flag
-    localView.setUint16(8, 0, true); // Store method (uncompressed, instant)
-    localView.setUint16(10, 0, true); // Mod time
-    localView.setUint16(12, 0x595d, true); // Mod date
-    localView.setUint32(14, crc, true); // CRC-32
-    localView.setUint32(18, dataBytes.length, true); // Compressed size
-    localView.setUint32(22, dataBytes.length, true); // Uncompressed size
-    localView.setUint16(26, nameBytes.length, true); // Filename length
-    localView.setUint16(28, 0, true); // Extra field length
+    localView.setUint32(0, 0x04034b50, true);
+    localView.setUint16(4, 20, true);
+    localView.setUint16(6, 0x0800, true);
+    localView.setUint16(8, 0, true);
+    localView.setUint16(10, 0, true);
+    localView.setUint16(12, 0x595d, true);
+    localView.setUint32(14, crc, true);
+    localView.setUint32(18, dataBytes.length, true);
+    localView.setUint32(22, dataBytes.length, true);
+    localView.setUint16(26, nameBytes.length, true);
+    localView.setUint16(28, 0, true);
     localHeader.set(nameBytes, 30);
 
     localParts.push(localHeader, dataBytes);
 
-    // Central directory header (46 bytes + filename)
     const centralHeader = new Uint8Array(46 + nameBytes.length);
     const centralView = new DataView(centralHeader.buffer);
-    centralView.setUint32(0, 0x02014b50, true); // Signature
-    centralView.setUint16(4, 20, true); // Version made by
-    centralView.setUint16(6, 20, true); // Version needed
-    centralView.setUint16(8, 0x0800, true); // UTF-8 flag
-    centralView.setUint16(10, 0, true); // Store method
-    centralView.setUint16(12, 0, true); // Mod time
-    centralView.setUint16(14, 0x595d, true); // Mod date
-    centralView.setUint32(16, crc, true); // CRC-32
-    centralView.setUint32(20, dataBytes.length, true); // Compressed size
-    centralView.setUint32(24, dataBytes.length, true); // Uncompressed size
-    centralView.setUint16(28, nameBytes.length, true); // Filename length
-    centralView.setUint16(30, 0, true); // Extra length
-    centralView.setUint16(32, 0, true); // Comment length
-    centralView.setUint16(34, 0, true); // Disk number
-    centralView.setUint16(36, 0, true); // Internal attrs
-    centralView.setUint32(38, 0, true); // External attrs
-    centralView.setUint32(42, offset, true); // Local header offset
+    centralView.setUint32(0, 0x02014b50, true);
+    centralView.setUint16(4, 20, true);
+    centralView.setUint16(6, 20, true);
+    centralView.setUint16(8, 0x0800, true);
+    centralView.setUint16(10, 0, true);
+    centralView.setUint16(12, 0, true);
+    centralView.setUint16(14, 0x595d, true);
+    centralView.setUint32(16, crc, true);
+    centralView.setUint32(20, dataBytes.length, true);
+    centralView.setUint32(24, dataBytes.length, true);
+    centralView.setUint16(28, nameBytes.length, true);
+    centralView.setUint16(30, 0, true);
+    centralView.setUint16(32, 0, true);
+    centralView.setUint16(34, 0, true);
+    centralView.setUint16(36, 0, true);
+    centralView.setUint32(38, 0, true);
+    centralView.setUint32(42, offset, true);
     centralHeader.set(nameBytes, 46);
 
     centralParts.push(centralHeader);
@@ -298,7 +465,7 @@ export function createZipArchive(files: { name: string; content: string }[]): Ui
   const centralDirSize = centralParts.reduce((acc, b) => acc + b.length, 0);
   const eocd = new Uint8Array(22);
   const eocdView = new DataView(eocd.buffer);
-  eocdView.setUint32(0, 0x06054b50, true); // End of central directory signature
+  eocdView.setUint32(0, 0x06054b50, true);
   eocdView.setUint16(4, 0, true);
   eocdView.setUint16(6, 0, true);
   eocdView.setUint16(8, files.length, true);
@@ -322,11 +489,6 @@ export function createZipArchive(files: { name: string; content: string }[]): Ui
   return result;
 }
 
-/**
- * High-speed Concurrency Queue Manager.
- * Processes queued PDF conversion tasks with configurable parallel workers (default 5)
- * so 10+ PDFs convert rapidly without blocking UI or overwhelming rate limits.
- */
 export class BatchQueueManager {
   private jobs: Map<string, PdfConversionJob> = new Map();
   private activeWorkers = 0;
@@ -355,11 +517,6 @@ export class BatchQueueManager {
   ) {
     this.concurrency = Math.max(1, concurrency);
     this.processor = processor;
-  }
-
-  public setConcurrency(concurrency: number): void {
-    this.concurrency = Math.max(1, Math.min(10, concurrency));
-    this.pump();
   }
 
   public enqueue(job: PdfConversionJob): PdfConversionJob {
@@ -411,7 +568,7 @@ export class BatchQueueManager {
       this.activeWorkers++;
       nextJob.stage = 'analyzing_visual';
       nextJob.progress = 25;
-      nextJob.stageDetail = 'Tahap 1: Memindai visual halaman, gambar & rumus LaTeX...';
+      nextJob.stageDetail = 'Tahap 1: Ekstraksi 1:1 halaman, gambar & rumus LaTeX...';
 
       this.runJob(nextJob).finally(() => {
         this.activeWorkers--;

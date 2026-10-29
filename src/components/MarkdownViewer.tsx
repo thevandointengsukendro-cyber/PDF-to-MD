@@ -32,8 +32,8 @@ export const MarkdownViewer: React.FC<MarkdownViewerProps> = ({
   };
 
   const renderInlineContent = (text: string) => {
-    // Parse inline math $...$, bold **...**, and inline code `...`
-    const parts = text.split(/(\$[^$]+\$|\*\*[^*]+\*\*|`[^`]+`)/g);
+    // Parse inline math $...$, bold **...**, italic *...*, and inline code `...`
+    const parts = text.split(/(\$[^$]+\$|\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`)/g);
     return parts.map((part, idx) => {
       if (part.startsWith('$') && part.endsWith('$') && part.length > 2) {
         return (
@@ -50,6 +50,13 @@ export const MarkdownViewer: React.FC<MarkdownViewerProps> = ({
           <strong key={idx} className="font-semibold text-slate-900">
             {part.slice(2, -2)}
           </strong>
+        );
+      }
+      if (part.startsWith('*') && part.endsWith('*') && part.length > 2) {
+        return (
+          <em key={idx} className="italic text-slate-800">
+            {part.slice(1, -1)}
+          </em>
         );
       }
       if (part.startsWith('`') && part.endsWith('`')) {
