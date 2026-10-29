@@ -1,0 +1,6 @@
+{
+  "name": "DocuForge MD — Batch PDF to Markdown Studio",
+  "description": "Konversi banyak file PDF sekaligus menjadi dokumen Markdown utuh dengan analisis visual halaman, ekstraksi rumus LaTeX presisi, penggabungan otomatis (Auto-Merge), dan unduhan kolektif ZIP.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
